@@ -1,12 +1,22 @@
 # The bazelrc file for MediaPipe OSS.
 
 # Tensorflow needs remote repo
-common --experimental_repo_remote_exec
+common --experimental_repo_remote_exec 
+
+# Verbose failure logs when something goes wrong
+common --verbose_failures
 
 # Basic build settings
 build --jobs 128
 build --define='absl=1'  # for gtest
 build --enable_platform_specific_config
+
+# Build with optimization enabled. This compiles the code with the -O2 flag, 
+# enabling various compiler optimizations that increase performance but may increase build time.
+build -c opt
+
+# Make Bazel print out all options from rc files.
+build --announce_rc
 
 # Enable stack traces
 test --test_env="GTEST_INSTALL_FAILURE_SIGNAL_HANDLER=1"
@@ -17,12 +27,19 @@ build:linux --host_cxxopt=-std=c++17
 build:linux --copt=-w
 
 # windows
-build:windows --cxxopt=/std:c++17
-build:windows --host_cxxopt=/std:c++17
-build:windows --copt=/w
-# For using M_* math constants on Windows with MSVC.
-build:windows --copt=/D_USE_MATH_DEFINES
-build:windows --host_copt=/D_USE_MATH_DEFINES
+build:windows --cxxopt=/std:c++17										# Set the C++ standard version to C++17 for Windows builds.							
+build:windows --host_cxxopt=/std:c++17									# Set the C++ standard version to C++17 for Windows host builds (affecting build tools).					
+build:windows --copt=/w													# Suppress all compiler warnings in Windows builds.
+build:windows --copt=/DBOOST_ERROR_CODE_HEADER_ONLY						# Define a preprocessor macro to include only the header file for Boost error codes in Windows builds.
+build:windows --copt=/DMESA_EGL_NO_X11_HEADERS							# Define a preprocessor macro to exclude X11 headers when using Mesa EGL in Windows builds.
+build:windows --copt=/DEGL_NO_X11										# Define a preprocessor macro to indicate that EGL (Embedded-System Graphics Library) should not include X11 headers in Windows builds.
+build:windows --copt=/D_USE_MATH_DEFINES								# For using M_* math constants on Windows with MSVC.
+build:windows --host_copt=/D_USE_MATH_DEFINES							# For using M_* math constants on Windows host build with MSVC compiler.
+build:windows --define MEDIAPIPE_DISABLE_GPU=1							# Disable GPU for mediapipe
+
+# Définir le chemin vers l'executable Python
+build:windows --action_env=PYTHON_BIN_PATH="C:/Users/hans9/AppData/Local/Programs/Python/Python310/python.exe"
+
 
 # macOS
 build:macos --cxxopt=-std=c++17
