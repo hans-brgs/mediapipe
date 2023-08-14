@@ -195,7 +195,7 @@ cc_library(
         "//mediapipe/framework:android_no_jni": ["resource_util_loonix.cc"],
         "//mediapipe:ios": ["resource_util_apple.cc"],
         "//mediapipe:macos": ["resource_util_default.cc"],
-        "//mediapipe:windows": ["resource_util_windows.cc"],
+        "//mediapipe:windows": ["resource_util_default.cc"],
     }),
     hdrs = [
         "resource_util.h",
