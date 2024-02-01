@@ -16,12 +16,14 @@
 
 #include <cmath>
 #include <complex>
+#include <cstdint>
 #include <memory>
 #include <numeric>
 #include <string>
 #include <vector>
 
 #include "Eigen/Core"
+#include "absl/log/absl_log.h"
 #include "audio/dsp/number_util.h"
 #include "mediapipe/calculators/audio/spectrogram_calculator.pb.h"
 #include "mediapipe/framework/calculator_framework.h"
@@ -31,7 +33,6 @@
 #include "mediapipe/framework/port/benchmark.h"
 #include "mediapipe/framework/port/gmock.h"
 #include "mediapipe/framework/port/gtest.h"
-#include "mediapipe/framework/port/integral_types.h"
 #include "mediapipe/framework/port/status.h"
 #include "mediapipe/util/time_series_test_util.h"
 
@@ -882,11 +883,11 @@ void BM_ProcessDC(benchmark::State& state) {
 
   const CalculatorRunner::StreamContents& output = runner.Outputs().Index(0);
   const Matrix& output_matrix = output.packets[0].Get<Matrix>();
-  LOG(INFO) << "Output matrix=" << output_matrix.rows() << "x"
-            << output_matrix.cols();
-  LOG(INFO) << "First values=" << output_matrix(0, 0) << ", "
-            << output_matrix(1, 0) << ", " << output_matrix(2, 0) << ", "
-            << output_matrix(3, 0);
+  ABSL_LOG(INFO) << "Output matrix=" << output_matrix.rows() << "x"
+                 << output_matrix.cols();
+  ABSL_LOG(INFO) << "First values=" << output_matrix(0, 0) << ", "
+                 << output_matrix(1, 0) << ", " << output_matrix(2, 0) << ", "
+                 << output_matrix(3, 0);
 }
 
 BENCHMARK(BM_ProcessDC);

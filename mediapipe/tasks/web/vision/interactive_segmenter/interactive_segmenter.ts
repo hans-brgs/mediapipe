@@ -34,8 +34,8 @@ import {InteractiveSegmenterResult} from './interactive_segmenter_result';
 
 export * from './interactive_segmenter_options';
 export * from './interactive_segmenter_result';
-export {RegionOfInterest};
-export {ImageSource};
+export {type RegionOfInterest};
+export {type ImageSource};
 
 const IMAGE_IN_STREAM = 'image_in';
 const NORM_RECT_IN_STREAM = 'norm_rect_in';
@@ -97,6 +97,7 @@ export class InteractiveSegmenter extends VisionTaskRunner {
   /**
    * Initializes the Wasm runtime and creates a new interactive segmenter from
    * the provided options.
+   * @export
    * @param wasmFileset A configuration object that provides the location of
    *     the Wasm binary and its loader.
    * @param interactiveSegmenterOptions The options for the Interactive
@@ -115,6 +116,7 @@ export class InteractiveSegmenter extends VisionTaskRunner {
   /**
    * Initializes the Wasm runtime and creates a new interactive segmenter based
    * on the provided model asset buffer.
+   * @export
    * @param wasmFileset A configuration object that provides the location of
    *     the Wasm binary and its loader.
    * @param modelAssetBuffer A binary representation of the model.
@@ -130,6 +132,7 @@ export class InteractiveSegmenter extends VisionTaskRunner {
   /**
    * Initializes the Wasm runtime and creates a new interactive segmenter based
    * on the path to the model asset.
+   * @export
    * @param wasmFileset A configuration object that provides the location of
    *     the Wasm binary and its loader.
    * @param modelAssetPath The path to the model asset.
@@ -171,6 +174,7 @@ export class InteractiveSegmenter extends VisionTaskRunner {
    * options. You can reset an option back to its default value by
    * explicitly setting it to `undefined`.
    *
+   * @export
    * @param options The options for the interactive segmenter.
    * @return A Promise that resolves when the settings have been applied.
    */
@@ -209,11 +213,10 @@ export class InteractiveSegmenter extends VisionTaskRunner {
    * callback returns. The `roi` parameter is used to represent a user's region
    * of interest for segmentation.
    *
-   * The 'image_processing_options' parameter can be used to specify the
-   * rotation to apply to the image before performing segmentation, by setting
-   * its 'rotationDegrees' field. Note that specifying a region-of-interest
-   * using the 'regionOfInterest' field is NOT supported and will result in an
-   * error.
+   * The 'imageProcessingOptions' parameter can be used to specify the rotation
+   * to apply to the image before performing segmentation, by setting its
+   * 'rotationDegrees' field. Note that specifying a region-of-interest using
+   * the 'regionOfInterest' field is NOT supported and will result in an error.
    *
    * @param image An image to process.
    * @param roi The region of interest for segmentation.
@@ -246,11 +249,10 @@ export class InteractiveSegmenter extends VisionTaskRunner {
    * and should not be used in high-throughput applications. The `roi` parameter
    * is used to represent a user's region of interest for segmentation.
    *
-   * The 'image_processing_options' parameter can be used to specify the
-   * rotation to apply to the image before performing segmentation, by setting
-   * its 'rotationDegrees' field. Note that specifying a region-of-interest
-   * using the 'regionOfInterest' field is NOT supported and will result in an
-   * error.
+   * The 'imageProcessingOptions' parameter can be used to specify the rotation
+   * to apply to the image before performing segmentation, by setting its
+   * 'rotationDegrees' field. Note that specifying a region-of-interest using
+   * the 'regionOfInterest' field is NOT supported and will result in an error.
    *
    * @param image An image to process.
    * @param roi The region of interest for segmentation.
@@ -263,6 +265,7 @@ export class InteractiveSegmenter extends VisionTaskRunner {
       image: ImageSource, roi: RegionOfInterest,
       imageProcessingOptions: ImageProcessingOptions):
       InteractiveSegmenterResult;
+  /** @export */
   segment(
       image: ImageSource, roi: RegionOfInterest,
       imageProcessingOptionsOrCallback?: ImageProcessingOptions|
@@ -336,7 +339,10 @@ export class InteractiveSegmenter extends VisionTaskRunner {
           CONFIDENCE_MASKS_STREAM, (masks, timestamp) => {
             this.confidenceMasks = masks.map(
                 wasmImage => this.convertToMPMask(
-                    wasmImage, /* shouldCopyData= */ !this.userCallback));
+                    wasmImage,
+                    /* interpolateValues= */ true,
+                    /* shouldCopyData= */ !this.userCallback,
+                    ));
             this.setLatestOutputTimestamp(timestamp);
           });
       this.graphRunner.attachEmptyPacketListener(
@@ -354,7 +360,8 @@ export class InteractiveSegmenter extends VisionTaskRunner {
       this.graphRunner.attachImageListener(
           CATEGORY_MASK_STREAM, (mask, timestamp) => {
             this.categoryMask = this.convertToMPMask(
-                mask, /* shouldCopyData= */ !this.userCallback);
+                mask, /* interpolateValues= */ false,
+                /* shouldCopyData= */ !this.userCallback);
             this.setLatestOutputTimestamp(timestamp);
           });
       this.graphRunner.attachEmptyPacketListener(

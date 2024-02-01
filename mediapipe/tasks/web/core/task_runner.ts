@@ -51,9 +51,17 @@ export async function createTaskRunner<T extends TaskRunner>(
     canvas: HTMLCanvasElement|OffscreenCanvas|null|undefined,
     fileset: WasmFileset, options: TaskRunnerOptions): Promise<T> {
   const fileLocator: FileLocator = {
-    locateFile() {
-      // The only file loaded with this mechanism is the Wasm binary
-      return fileset.wasmBinaryPath.toString();
+    locateFile(file): string {
+      // We currently only use a single .wasm file and a single .data file (for
+      // the tasks that have to load assets). We need to revisit how we
+      // initialize the file locator if we ever need to differentiate between
+      // diffferent files.
+      if (file.endsWith('.wasm')) {
+        return fileset.wasmBinaryPath.toString();
+      } else if (fileset.assetBinaryPath && file.endsWith('.data')) {
+        return fileset.assetBinaryPath.toString();
+      }
+      return file;
     }
   };
 
@@ -137,7 +145,7 @@ export abstract class TaskRunner {
             })
             .then(buffer => {
               try {
-                // Try to delete file as we cannot overwite an existing file
+                // Try to delete file as we cannot overwrite an existing file
                 // using our current API.
                 this.graphRunner.wasmModule.FS_unlink('/model.dat');
               } catch {
@@ -318,7 +326,10 @@ export abstract class TaskRunner {
         true, FREE_MEMORY_STREAM, this.latestOutputTimestamp);
   }
 
-  /** Closes and cleans up the resources held by this task. */
+  /**
+   * Closes and cleans up the resources held by this task.
+   * @export
+   */
   close(): void {
     this.keepaliveNode = undefined;
     this.graphRunner.closeGraph();

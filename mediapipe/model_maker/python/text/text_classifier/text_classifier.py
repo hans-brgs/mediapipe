@@ -29,10 +29,12 @@ from mediapipe.model_maker.python.core.utils import loss_functions
 from mediapipe.model_maker.python.core.utils import metrics
 from mediapipe.model_maker.python.core.utils import model_util
 from mediapipe.model_maker.python.core.utils import quantization
+from mediapipe.model_maker.python.text.text_classifier import bert_tokenizer
 from mediapipe.model_maker.python.text.text_classifier import dataset as text_ds
 from mediapipe.model_maker.python.text.text_classifier import hyperparameters as hp
 from mediapipe.model_maker.python.text.text_classifier import model_options as mo
 from mediapipe.model_maker.python.text.text_classifier import model_spec as ms
+from mediapipe.model_maker.python.text.text_classifier import model_with_tokenizer
 from mediapipe.model_maker.python.text.text_classifier import preprocessor
 from mediapipe.model_maker.python.text.text_classifier import text_classifier_options
 from mediapipe.tasks.python.metadata.metadata_writers import metadata_writer
@@ -132,6 +134,22 @@ class TextClassifier(classifier.Classifier):
 
     return text_classifier
 
+  @classmethod
+  def load_bert_classifier(
+      cls,
+      options: text_classifier_options.TextClassifierOptions,
+      saved_model_path: str,
+      label_names: Sequence[str],
+  ) -> "TextClassifier":
+    if not isinstance(options.supported_model.value(), ms.BertClassifierSpec):
+      raise ValueError(
+          "Only loading BertClassifier is supported, got:"
+          f" {options.supported_model}"
+      )
+    return _BertClassifier.load_bert_classifier(
+        options, saved_model_path, label_names
+    )
+
   def evaluate(
       self,
       data: ds.Dataset,
@@ -169,6 +187,25 @@ class TextClassifier(classifier.Classifier):
     with self._hparams.get_strategy().scope():
       return self._model.evaluate(dataset)
 
+  def save_model(
+      self,
+      model_name: str = "saved_model",
+  ):
+    """Saves the model in SavedModel format.
+
+    For more information, see https://www.tensorflow.org/guide/saved_model.
+
+    Args:
+      model_name: Name of the saved model.
+    """
+    tf.io.gfile.makedirs(self._hparams.export_dir)
+    saved_model_file = os.path.join(self._hparams.export_dir, model_name)
+    self._model.save(
+        saved_model_file,
+        include_optimizer=False,
+        save_format="tf",
+    )
+
   def export_model(
       self,
       model_name: str = "model.tflite",
@@ -184,12 +221,16 @@ class TextClassifier(classifier.Classifier):
         path is {self._hparams.export_dir}/{model_name}.
       quantization_config: The configuration for model quantization.
     """
+    tf.io.gfile.makedirs(self._hparams.export_dir)
     tflite_file = os.path.join(self._hparams.export_dir, model_name)
-    tf.io.gfile.makedirs(os.path.dirname(tflite_file))
     metadata_file = os.path.join(self._hparams.export_dir, "metadata.json")
 
-    tflite_model = model_util.convert_to_tflite(
-        model=self._model, quantization_config=quantization_config)
+    self.save_model(model_name="saved_model")
+    saved_model_file = os.path.join(self._hparams.export_dir, "saved_model")
+
+    tflite_model = model_util.convert_to_tflite_from_file(
+        saved_model_file, quantization_config=quantization_config
+    )
     vocab_filepath = os.path.join(tempfile.mkdtemp(), "vocab.txt")
     self._save_vocab(vocab_filepath)
 
@@ -328,7 +369,6 @@ class _AverageWordEmbeddingClassifier(TextClassifier):
     return text_classifier_writer.MetadataWriter.create_for_regex_model(
         model_buffer=tflite_model,
         regex_tokenizer=metadata_writer.RegexTokenizer(
-            # TODO: Align with MediaPipe's RegexTokenizer.
             delim_regex_pattern=self._DELIM_REGEX_PATTERN,
             vocab_file_path=vocab_filepath),
         labels=metadata_writer.Labels().add(list(self._label_names)))
@@ -348,7 +388,19 @@ class _BertClassifier(TextClassifier):
   ):
     super().__init__(model_spec, label_names, hparams.shuffle)
     self._hparams = hparams
-    self._callbacks = model_util.get_default_callbacks(self._hparams.export_dir)
+    self._callbacks = list(
+        model_util.get_default_callbacks(
+            self._hparams.export_dir, self._hparams.checkpoint_frequency
+        )
+    ) + [
+        tf.keras.callbacks.ModelCheckpoint(
+            os.path.join(self._hparams.export_dir, "best_model"),
+            monitor="val_auc",
+            mode="max",
+            save_best_only=True,
+            save_weights_only=False,
+        )
+    ]
     self._model_options = model_options
     self._text_preprocessor: preprocessor.BertClassifierPreprocessor = None
     with self._hparams.get_strategy().scope():
@@ -378,8 +430,43 @@ class _BertClassifier(TextClassifier):
         model_spec=options.supported_model.value(),
         model_options=options.model_options,
         hparams=options.hparams,
-        label_names=train_data.label_names)
+        label_names=train_data.label_names,
+    )
     bert_classifier._create_and_train_model(train_data, validation_data)
+    return bert_classifier
+
+  @classmethod
+  def load_bert_classifier(
+      cls,
+      options: text_classifier_options.TextClassifierOptions,
+      saved_model_path: str,
+      label_names: Sequence[str],
+  ) -> "_BertClassifier":
+    bert_classifier = _BertClassifier(
+        model_spec=options.supported_model.value(),
+        model_options=options.model_options,
+        hparams=options.hparams,
+        label_names=label_names,
+    )
+    with bert_classifier._hparams.get_strategy().scope():
+      bert_classifier._create_model()
+      # create dummy optimizer so model compiles
+      bert_classifier._optimizer = tfa_optimizers.LAMB(
+          3e-4,
+          weight_decay_rate=bert_classifier._hparams.weight_decay,
+          epsilon=1e-6,
+          exclude_from_weight_decay=["LayerNorm", "layer_norm", "bias"],
+          global_clipnorm=1.0,
+      )
+      bert_classifier._model = tf.keras.models.load_model(
+          saved_model_path, compile=False
+      )
+    bert_classifier._load_preprocessor()
+    bert_classifier._model.compile(
+        optimizer=bert_classifier._optimizer,
+        loss=bert_classifier._loss_function,
+        metrics=bert_classifier._metric_functions,
+    )
     return bert_classifier
 
   def _create_and_train_model(self, train_data: text_ds.Dataset,
@@ -390,17 +477,29 @@ class _BertClassifier(TextClassifier):
       train_data: Training data.
       validation_data: Validation data.
     """
-    (processed_train_data, processed_validation_data) = (
-        self._load_and_run_preprocessor(train_data, validation_data))
+    self._load_preprocessor()
+    (processed_train_data, processed_validation_data) = self._run_preprocessor(
+        train_data, validation_data
+    )
     with self._hparams.get_strategy().scope():
       self._create_model()
       self._create_optimizer(processed_train_data)
     self._train_model(processed_train_data, processed_validation_data)
 
-  def _load_and_run_preprocessor(
+  def _load_preprocessor(self):
+    """Loads a BertClassifierPreprocessor."""
+    self._text_preprocessor = preprocessor.BertClassifierPreprocessor(
+        seq_len=self._model_options.seq_len,
+        do_lower_case=self._model_spec.do_lower_case,
+        uri=self._model_spec.get_path(),
+        model_name=self._model_spec.name,
+        tokenizer=self._hparams.tokenizer,
+    )
+
+  def _run_preprocessor(
       self, train_data: text_ds.Dataset, validation_data: text_ds.Dataset
   ) -> Tuple[text_ds.Dataset, text_ds.Dataset]:
-    """Loads a BertClassifierPreprocessor and runs it on the data.
+    """Runs BertClassifierPreprocessor on the data.
 
     Args:
       train_data: Training data.
@@ -409,12 +508,6 @@ class _BertClassifier(TextClassifier):
     Returns:
       Preprocessed training data and preprocessed validation data.
     """
-    self._text_preprocessor = preprocessor.BertClassifierPreprocessor(
-        seq_len=self._model_options.seq_len,
-        do_lower_case=self._model_spec.do_lower_case,
-        uri=self._model_spec.get_path(),
-        model_name=self._model_spec.name,
-    )
     return (
         self._text_preprocessor.preprocess(train_data),
         self._text_preprocessor.preprocess(validation_data),
@@ -438,6 +531,7 @@ class _BertClassifier(TextClassifier):
         ),
         metrics.SparsePrecision(name="precision", dtype=tf.float32),
         metrics.SparseRecall(name="recall", dtype=tf.float32),
+        metrics.BinaryAUC(name="auc", num_thresholds=1000),
     ]
     if self._num_classes == 2:
       if self._hparams.desired_precisions:
@@ -494,6 +588,9 @@ class _BertClassifier(TextClassifier):
       encoder = hub.KerasLayer(
           self._model_spec.get_path(),
           trainable=self._model_options.do_fine_tuning,
+          load_options=tf.saved_model.LoadOptions(
+              experimental_io_device="/job:localhost"
+          ),
       )
       encoder_outputs = encoder(encoder_inputs)
       pooled_output = encoder_outputs["pooled_output"]
@@ -512,16 +609,18 @@ class _BertClassifier(TextClassifier):
       pooled_output = encoder(renamed_inputs)
 
     output = tf.keras.layers.Dropout(rate=self._model_options.dropout_rate)(
-        pooled_output)
+        pooled_output
+    )
     initializer = tf.keras.initializers.TruncatedNormal(
-        stddev=self._INITIALIZER_RANGE)
+        stddev=self._INITIALIZER_RANGE
+    )
     output = tf.keras.layers.Dense(
         self._num_classes,
         kernel_initializer=initializer,
         name="output",
         activation="softmax",
-        dtype=tf.float32)(
-            output)
+        dtype=tf.float32,
+    )(output)
     self._model = tf.keras.Model(inputs=encoder_inputs, outputs=output)
 
   def _create_optimizer(self, train_data: text_ds.Dataset):
@@ -591,3 +690,56 @@ class _BertClassifier(TextClassifier):
         ids_name=self._model_spec.tflite_input_name["ids"],
         mask_name=self._model_spec.tflite_input_name["mask"],
         segment_name=self._model_spec.tflite_input_name["segment_ids"])
+
+  def export_model_with_tokenizer(
+      self,
+      model_name: str = "model_with_tokenizer.tflite",
+      quantization_config: Optional[quantization.QuantizationConfig] = None,
+  ):
+    """Converts and saves the model to a TFLite file with the tokenizer.
+
+    Note that unlike the export_model method, this export method will include
+    a FastBertTokenizer in the TFLite graph. The resulting TFLite will not have
+    metadata information to use with MediaPipe Tasks, but can be run directly
+    using TFLite Inference: https://www.tensorflow.org/lite/guide/inference
+
+    For more information on the tokenizer, see:
+      https://www.tensorflow.org/text/api_docs/python/text/FastBertTokenizer
+
+    Args:
+      model_name: File name to save TFLite model with tokenizer. The full export
+        path is {self._hparams.export_dir}/{model_name}.
+      quantization_config: The configuration for model quantization.
+    """
+    tf.io.gfile.makedirs(self._hparams.export_dir)
+    tflite_file = os.path.join(self._hparams.export_dir, model_name)
+    if (
+        self._hparams.tokenizer
+        != bert_tokenizer.SupportedBertTokenizers.FAST_BERT_TOKENIZER
+    ):
+      print(
+          f"WARNING: This model was trained with {self._hparams.tokenizer} "
+          "tokenizer, but the exported model with tokenizer will have a "
+          f"{bert_tokenizer.SupportedBertTokenizers.FAST_BERT_TOKENIZER} "
+          "tokenizer."
+      )
+      tokenizer = bert_tokenizer.BertFastTokenizer(
+          vocab_file=self._text_preprocessor.get_vocab_file(),
+          do_lower_case=self._model_spec.do_lower_case,
+          seq_len=self._model_options.seq_len,
+      )
+    else:
+      tokenizer = self._text_preprocessor.tokenizer
+
+    model = model_with_tokenizer.ModelWithTokenizer(tokenizer, self._model)
+    model(tf.constant(["Example input data".encode("utf-8")]))  # build model
+    saved_model_file = os.path.join(
+        self._hparams.export_dir, "saved_model_with_tokenizer"
+    )
+    model.save(saved_model_file)
+    tflite_model = model_util.convert_to_tflite_from_file(
+        saved_model_file,
+        quantization_config=quantization_config,
+        allow_custom_ops=True,
+    )
+    model_util.save_tflite(tflite_model, tflite_file)

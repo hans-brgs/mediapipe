@@ -1,0 +1,51 @@
+/* Copyright 2023 The MediaPipe Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+syntax = "proto3";
+
+package mediapipe.tasks.core.jni;
+
+option java_package = "com.google.mediapipe.tasks.core.jni.proto";
+option java_outer_classname = "LlmOptionsProto";
+
+// Configurable parameters for creating an LLM session.
+message LlmSessionConfig {
+  enum LlmBackend {
+    UNKNOWN_DELEGATE = 0;
+    CPU = 1;
+    GPU = 2;
+  }
+  // Path to the tflite model file.
+  string model_path = 5;
+
+  // The backend to use for processing.
+  LlmBackend backend = 1;
+
+  // The number of input tokens to process at a time for batch processing
+  uint32 sequence_batch_size = 2;
+
+  // The number of decoding steps to run for each GPU-CPU sync. 1 stands for
+  // full streaming mode (i.e. the model outputs one token at a time). -1 stands
+  // for non-streaming mode (i.e. the model decodes all the way to the end and
+  // output the result at once). Note that the more frequent to perform GPU-CPU
+  // sync (i.e. closer to 1), the more latency we expect to introduce.
+  uint32 num_decode_steps_per_sync = 3;
+
+  // The total length of the kv-cache. In other words, this is the total number
+  // of input + output tokens the model needs to handle.
+  uint32 max_sequence_length = 4;
+
+  reserved 6;
+}

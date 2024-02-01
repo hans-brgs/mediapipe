@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/log/absl_check.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "mediapipe/calculators/tensor/image_to_tensor_utils.h"
@@ -32,6 +33,7 @@
 #include "mediapipe/framework/port/opencv_imgproc_inc.h"
 #include "mediapipe/framework/port/status.h"
 #include "mediapipe/gpu/gpu_origin.pb.h"
+#include "mediapipe/gpu/gpu_service.h"
 #include "mediapipe/tasks/cc/vision/face_stylizer/calculators/tensors_to_image_calculator.pb.h"
 
 #if !MEDIAPIPE_DISABLE_GPU
@@ -144,7 +146,8 @@ absl::Status TensorsToImageCalculator::UpdateContract(CalculatorContract* cc) {
 #if MEDIAPIPE_METAL_ENABLED
   MP_RETURN_IF_ERROR([MPPMetalHelper updateContract:cc]);
 #else
-  return GlCalculatorHelper::UpdateContract(cc);
+  return GlCalculatorHelper::UpdateContract(cc,
+                                            /*requesst_gpu_as_optional=*/true);
 #endif  // MEDIAPIPE_METAL_ENABLED
 #endif  // !MEDIAPIPE_DISABLE_GPU
   return absl::OkStatus();
@@ -152,18 +155,9 @@ absl::Status TensorsToImageCalculator::UpdateContract(CalculatorContract* cc) {
 
 absl::Status TensorsToImageCalculator::Open(CalculatorContext* cc) {
   options_ = cc->Options<TensorsToImageCalculatorOptions>();
-  if (CanUseGpu()) {
-#if !MEDIAPIPE_DISABLE_GPU
-#if MEDIAPIPE_METAL_ENABLED
-    gpu_helper_ = [[MPPMetalHelper alloc] initWithCalculatorContext:cc];
-    RET_CHECK(gpu_helper_);
-#else
-    MP_RETURN_IF_ERROR(gl_helper_.Open(cc));
-#endif  // MEDIAPIPE_METAL_ENABLED
-#endif  // !MEDIAPIPE_DISABLE_GPU
-  } else {
-    CHECK(options_.has_input_tensor_float_range() ^
-          options_.has_input_tensor_uint_range())
+  if (!CanUseGpu()) {
+    ABSL_CHECK(options_.has_input_tensor_float_range() ^
+               options_.has_input_tensor_uint_range())
         << "Must specify either `input_tensor_float_range` or "
            "`input_tensor_uint_range` in the calculator options";
   }
@@ -178,7 +172,9 @@ absl::Status TensorsToImageCalculator::Process(CalculatorContext* cc) {
 #if MEDIAPIPE_METAL_ENABLED
     return MetalProcess(cc);
 #else
-    return GlProcess(cc);
+    if (cc->Service(kGpuService).IsAvailable()) {
+      return GlProcess(cc);
+    }
 #endif  // MEDIAPIPE_METAL_ENABLED
 #endif  // !MEDIAPIPE_DISABLE_GPU
   }
@@ -187,14 +183,16 @@ absl::Status TensorsToImageCalculator::Process(CalculatorContext* cc) {
 
 absl::Status TensorsToImageCalculator::Close(CalculatorContext* cc) {
 #if !MEDIAPIPE_DISABLE_GPU && !MEDIAPIPE_METAL_ENABLED
-  gl_helper_.RunInGlContext([this] {
+  if (gl_initialized_) {
+    gl_helper_.RunInGlContext([this] {
 #if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
-    gl_compute_program_.reset();
+      gl_compute_program_.reset();
 #else
-    if (program_) glDeleteProgram(program_);
-    program_ = 0;
+      if (program_) glDeleteProgram(program_);
+      program_ = 0;
 #endif  // MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
-  });
+    });
+  }
 #endif  // !MEDIAPIPE_DISABLE_GPU && !MEDIAPIPE_METAL_ENABLED
   return absl::OkStatus();
 }
@@ -231,10 +229,10 @@ absl::Status TensorsToImageCalculator::CpuProcess(CalculatorContext* cc) {
         CV_MAKETYPE(CV_32F, tensor_in_channels),
         const_cast<float*>(input_tensor.GetCpuReadView().buffer<float>()));
     auto input_range = options_.input_tensor_float_range();
-    ASSIGN_OR_RETURN(auto transform,
-                     GetValueRangeTransformation(
-                         input_range.min(), input_range.max(),
-                         kOutputImageRangeMin, kOutputImageRangeMax));
+    MP_ASSIGN_OR_RETURN(auto transform,
+                        GetValueRangeTransformation(
+                            input_range.min(), input_range.max(),
+                            kOutputImageRangeMin, kOutputImageRangeMax));
     tensor_matview.convertTo(output_matview,
                              CV_MAKETYPE(CV_8U, tensor_in_channels),
                              transform.scale, transform.offset);
@@ -244,10 +242,10 @@ absl::Status TensorsToImageCalculator::CpuProcess(CalculatorContext* cc) {
         CV_MAKETYPE(CV_8U, tensor_in_channels),
         const_cast<uint8_t*>(input_tensor.GetCpuReadView().buffer<uint8_t>()));
     auto input_range = options_.input_tensor_uint_range();
-    ASSIGN_OR_RETURN(auto transform,
-                     GetValueRangeTransformation(
-                         input_range.min(), input_range.max(),
-                         kOutputImageRangeMin, kOutputImageRangeMax));
+    MP_ASSIGN_OR_RETURN(auto transform,
+                        GetValueRangeTransformation(
+                            input_range.min(), input_range.max(),
+                            kOutputImageRangeMin, kOutputImageRangeMax));
     tensor_matview.convertTo(output_matview,
                              CV_MAKETYPE(CV_8U, tensor_in_channels),
                              transform.scale, transform.offset);
@@ -314,6 +312,9 @@ absl::Status TensorsToImageCalculator::MetalProcess(CalculatorContext* cc) {
 }
 
 absl::Status TensorsToImageCalculator::MetalSetup(CalculatorContext* cc) {
+  gpu_helper_ = [[MPPMetalHelper alloc] initWithCalculatorContext:cc];
+  RET_CHECK(gpu_helper_);
+
   id<MTLDevice> device = gpu_helper_.mtlDevice;
   const std::string shader_source =
       R"(
@@ -449,6 +450,10 @@ absl::Status TensorsToImageCalculator::GlSetup(CalculatorContext* cc) {
 }
 
 absl::Status TensorsToImageCalculator::GlProcess(CalculatorContext* cc) {
+  if (!gl_initialized_) {
+    MP_RETURN_IF_ERROR(gl_helper_.Open(cc));
+  }
+
   return gl_helper_.RunInGlContext([this, cc]() -> absl::Status {
     if (!gl_initialized_) {
       MP_RETURN_IF_ERROR(GlSetup(cc));
@@ -471,13 +476,11 @@ absl::Status TensorsToImageCalculator::GlProcess(CalculatorContext* cc) {
 
 #if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
 
-    auto out_texture = std::make_unique<tflite::gpu::gl::GlTexture>();
-    MP_RETURN_IF_ERROR(CreateReadWriteRgbaImageTexture(
-        tflite::gpu::DataType::UINT8,  // GL_RGBA8
-        {tensor_width, tensor_height}, out_texture.get()));
+    auto out_texture = gl_helper_.CreateDestinationTexture(
+        tensor_width, tensor_height, GpuBufferFormat::kImmutableRGBA32);
 
     const int output_index = 0;
-    glBindImageTexture(output_index, out_texture->id(), 0, GL_FALSE, 0,
+    glBindImageTexture(output_index, out_texture.name(), 0, GL_FALSE, 0,
                        GL_WRITE_ONLY, GL_RGBA8);
 
     auto read_view = input_tensor.GetOpenGlBufferReadView();
@@ -493,16 +496,7 @@ absl::Status TensorsToImageCalculator::GlProcess(CalculatorContext* cc) {
 
     MP_RETURN_IF_ERROR(gl_compute_program_->Dispatch(workgroups));
 
-    auto texture_buffer = mediapipe::GlTextureBuffer::Wrap(
-        out_texture->target(), out_texture->id(), tensor_width, tensor_height,
-        mediapipe::GpuBufferFormat::kBGRA32,
-        [ptr = out_texture.release()](
-            std::shared_ptr<mediapipe::GlSyncPoint> sync_token) mutable {
-          delete ptr;
-        });
-
-    auto output =
-        std::make_unique<mediapipe::GpuBuffer>(std::move(texture_buffer));
+    auto output = out_texture.GetFrame<GpuBuffer>();
     kOutputImage(cc).Send(Image(*output));
 
 #else

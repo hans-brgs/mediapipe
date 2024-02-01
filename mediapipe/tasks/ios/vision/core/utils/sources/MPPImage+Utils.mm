@@ -22,20 +22,55 @@
 #import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
 
+#include <cstdint>
+#include <memory>
+
 #include "mediapipe/framework/formats/image_format.pb.h"
 
 namespace {
+using ::mediapipe::ImageFormat;
 using ::mediapipe::ImageFrame;
+
+vImage_Buffer CreateEmptyVImageBufferFromImageFrame(ImageFrame &imageFrame, bool shouldAllocate) {
+  UInt8 *data = shouldAllocate ? new UInt8[imageFrame.Height() * imageFrame.WidthStep()] : nullptr;
+  return {.data = data,
+          .height = static_cast<vImagePixelCount>(imageFrame.Height()),
+          .width = static_cast<vImagePixelCount>(imageFrame.Width()),
+          .rowBytes = static_cast<size_t>(imageFrame.WidthStep())};
 }
+
+vImage_Buffer CreateVImageBufferFromImageFrame(ImageFrame &imageFrame) {
+  vImage_Buffer imageBuffer = CreateEmptyVImageBufferFromImageFrame(imageFrame, false);
+  imageBuffer.data = imageFrame.MutablePixelData();
+  return imageBuffer;
+}
+
+vImage_Buffer allocatedVImageBuffer(vImagePixelCount width, vImagePixelCount height,
+                                    size_t rowBytes) {
+  UInt8 *data = new UInt8[height * rowBytes];
+  return {.data = data, .height = height, .width = width, .rowBytes = rowBytes};
+}
+
+static void FreeDataProviderReleaseCallback(void *buffer, const void *data, size_t size) {
+  delete[] (vImage_Buffer *)buffer;
+}
+
+static void FreeRefConReleaseCallback(void *refCon, const void *baseAddress) { free(refCon); }
+
+}  // namespace
 
 @interface MPPPixelDataUtils : NSObject
 
-+ (uint8_t *)rgbPixelDataFromPixelData:(uint8_t *)pixelData
-                             withWidth:(size_t)width
-                                height:(size_t)height
-                                stride:(size_t)stride
-                     pixelBufferFormat:(OSType)pixelBufferFormatType
-                                 error:(NSError **)error;
++ (std::unique_ptr<ImageFrame>)imageFrameFromPixelData:(uint8_t *)pixelData
+                                             withWidth:(size_t)width
+                                                height:(size_t)height
+                                                stride:(size_t)stride
+                                     pixelBufferFormat:(OSType)pixelBufferFormatType
+                                                 error:(NSError **)error;
+
++ (UInt8 *)pixelDataFromImageFrame:(ImageFrame &)imageFrame
+                        shouldCopy:(BOOL)shouldCopy
+                             error:(NSError **)error;
 
 @end
 
@@ -44,11 +79,32 @@ using ::mediapipe::ImageFrame;
 + (std::unique_ptr<ImageFrame>)imageFrameFromCVPixelBuffer:(CVPixelBufferRef)pixelBuffer
                                                      error:(NSError **)error;
 
+// This method is used to create CVPixelBuffer from output images of tasks like `FaceStylizer` only
+// when the input `MPImage` source type is `pixelBuffer`.
+// Always copies the pixel data of the image frame to the created `CVPixelBuffer`.
+//
+// The only possible 32 RGBA pixel format of input `CVPixelBuffer` is `kCVPixelFormatType_32BGRA`.
+// But Mediapipe does not support inference on images of format `BGRA`. Hence the channels of the
+// underlying pixel data of `CVPixelBuffer` are permuted to the supported RGBA format before passing
+// them to the task for inference. The pixel format of the output images of any MediaPipe task will
+// be the same as the pixel format of the input image. (RGBA in this case).
+//
+// Since creation of `CVPixelBuffer` from the output image pixels with a format of
+// `kCVPixelFormatType_32RGBA` is not possible, the channels of the output C++ image `RGBA` have to
+// be permuted to the format `BGRA`. When the pixels are copied to create `CVPixelBuffer` this does
+// not pose a challenge.
+//
+// TODO: Investigate if permuting channels of output `mediapipe::Image` in place is possible for
+// creating `CVPixelBuffer`s without copying the underlying pixels.
++ (CVPixelBufferRef)cvPixelBufferFromImageFrame:(ImageFrame &)imageFrame error:(NSError **)error;
 @end
 
 @interface MPPCGImageUtils : NSObject
 
 + (std::unique_ptr<ImageFrame>)imageFrameFromCGImage:(CGImageRef)cgImage error:(NSError **)error;
++ (CGImageRef)cgImageFromImageFrame:(std::shared_ptr<ImageFrame>)imageFrame
+                shouldCopyPixelData:(BOOL)shouldCopyPixelData
+                              error:(NSError **)error;
 
 @end
 
@@ -60,121 +116,188 @@ using ::mediapipe::ImageFrame;
 
 @implementation MPPPixelDataUtils : NSObject
 
-+ (uint8_t *)rgbPixelDataFromPixelData:(uint8_t *)pixelData
-                             withWidth:(size_t)width
-                                height:(size_t)height
-                                stride:(size_t)stride
-                     pixelBufferFormat:(OSType)pixelBufferFormatType
-                                 error:(NSError **)error {
-  NSInteger destinationChannelCount = 3;
++ (std::unique_ptr<ImageFrame>)imageFrameFromPixelData:(uint8_t *)pixelData
+                                             withWidth:(size_t)width
+                                                height:(size_t)height
+                                                stride:(size_t)stride
+                                     pixelBufferFormat:(OSType)pixelBufferFormatType
+                                                 error:(NSError **)error {
+  NSInteger destinationChannelCount = 4;
   size_t destinationBytesPerRow = width * destinationChannelCount;
 
-  uint8_t *destPixelBufferAddress =
-      (uint8_t *)[MPPCommonUtils mallocWithSize:sizeof(uint8_t) * height * destinationBytesPerRow
-                                          error:error];
-
-  if (!destPixelBufferAddress) {
-    return NULL;
-  }
+  ImageFormat::Format imageFormat = ImageFormat::SRGBA;
 
   vImage_Buffer srcBuffer = {.data = pixelData,
                              .height = (vImagePixelCount)height,
                              .width = (vImagePixelCount)width,
                              .rowBytes = stride};
 
-  vImage_Buffer destBuffer = {.data = destPixelBufferAddress,
-                              .height = (vImagePixelCount)height,
-                              .width = (vImagePixelCount)width,
-                              .rowBytes = destinationBytesPerRow};
+  vImage_Buffer destBuffer;
 
   vImage_Error convertError = kvImageNoError;
 
+  // Convert the raw pixel data to RGBA format and un-premultiply the alpha from the R, G, B values
+  // since MediaPipe C++ APIs only accept un pre-multiplied channels.
+  //
+  // This method is commonly used for `MPImage`s of all source types. Hence supporting BGRA and RGBA
+  // formats. Only `pixelBuffer` source type is restricted to `BGRA` format.
   switch (pixelBufferFormatType) {
     case kCVPixelFormatType_32RGBA: {
-      convertError = vImageConvert_RGBA8888toRGB888(&srcBuffer, &destBuffer, kvImageNoFlags);
+      destBuffer = allocatedVImageBuffer((vImagePixelCount)width, (vImagePixelCount)height,
+                                         destinationBytesPerRow);
+      convertError = vImageUnpremultiplyData_RGBA8888(&srcBuffer, &destBuffer, kvImageNoFlags);
       break;
     }
     case kCVPixelFormatType_32BGRA: {
-      convertError = vImageConvert_BGRA8888toRGB888(&srcBuffer, &destBuffer, kvImageNoFlags);
+      // Permute channels to `RGBA` since MediaPipe tasks don't support inference on images of
+      // format `BGRA`.
+      const uint8_t permute_map[4] = {2, 1, 0, 3};
+      destBuffer = allocatedVImageBuffer((vImagePixelCount)width, (vImagePixelCount)height,
+                                         destinationBytesPerRow);
+      convertError =
+          vImagePermuteChannels_ARGB8888(&srcBuffer, &destBuffer, permute_map, kvImageNoFlags);
+      if (convertError == kvImageNoError) {
+        convertError = vImageUnpremultiplyData_RGBA8888(&destBuffer, &destBuffer, kvImageNoFlags);
+      }
       break;
     }
     default: {
       [MPPCommonUtils createCustomError:error
                                withCode:MPPTasksErrorCodeInvalidArgumentError
-                            description:@"Invalid source pixel buffer format. Expecting one of "
-                                        @"kCVPixelFormatType_32RGBA, kCVPixelFormatType_32BGRA"];
-
-      free(destPixelBufferAddress);
-      return NULL;
+                            description:@"Some internal error occured."];
+      return nullptr;
     }
   }
 
   if (convertError != kvImageNoError) {
     [MPPCommonUtils createCustomError:error
                              withCode:MPPTasksErrorCodeInternalError
-                          description:@"Image format conversion failed."];
-
-    free(destPixelBufferAddress);
-    return NULL;
+                          description:@"Some error occured while preprocessing the input image. "
+                                      @"Please verify that the image is not corrupted."];
+    return nullptr;
   }
 
-  return destPixelBufferAddress;
+  // Uses default deleter
+  return std::make_unique<ImageFrame>(imageFormat, width, height, destinationBytesPerRow,
+                                      static_cast<uint8_t *>(destBuffer.data));
+}
+
++ (UInt8 *)pixelDataFromImageFrame:(ImageFrame &)imageFrame
+                        shouldCopy:(BOOL)shouldCopy
+                             error:(NSError **)error {
+  vImage_Buffer sourceBuffer = CreateVImageBufferFromImageFrame(imageFrame);
+
+  // Pre-multiply the raw pixels from a `mediapipe::Image` before creating a `CGImage` to ensure
+  // that pixels are displayed correctly irrespective of their alpha values.
+  vImage_Error premultiplyError;
+  vImage_Buffer destinationBuffer;
+
+  switch (imageFrame.Format()) {
+    case ImageFormat::SRGBA: {
+      destinationBuffer =
+          shouldCopy ? CreateEmptyVImageBufferFromImageFrame(imageFrame, true) : sourceBuffer;
+      premultiplyError =
+          vImagePremultiplyData_RGBA8888(&sourceBuffer, &destinationBuffer, kvImageNoFlags);
+      break;
+    }
+    default: {
+      [MPPCommonUtils createCustomError:error
+                               withCode:MPPTasksErrorCodeInternalError
+                            description:@"An error occured while processing the output image "
+                                        @"pixels of the vision task."];
+      return nullptr;
+    }
+  }
+
+  if (premultiplyError != kvImageNoError) {
+    [MPPCommonUtils
+        createCustomError:error
+                 withCode:MPPTasksErrorCodeInternalError
+              description:
+                  @"An error occured while processing the output image pixels of the vision task."];
+
+    return nullptr;
+  }
+
+  return (UInt8 *)destinationBuffer.data;
 }
 
 @end
 
 @implementation MPPCVPixelBufferUtils
 
-+ (std::unique_ptr<ImageFrame>)rgbImageFrameFromCVPixelBuffer:(CVPixelBufferRef)pixelBuffer
-                                                        error:(NSError **)error {
-  CVPixelBufferLockBaseAddress(pixelBuffer, 0);
-
-  size_t width = CVPixelBufferGetWidth(pixelBuffer);
-  size_t height = CVPixelBufferGetHeight(pixelBuffer);
-
-  size_t destinationChannelCount = 3;
-  size_t destinationStride = destinationChannelCount * width;
-
-  uint8_t *rgbPixelData = [MPPPixelDataUtils
-      rgbPixelDataFromPixelData:(uint8_t *)CVPixelBufferGetBaseAddress(pixelBuffer)
-                      withWidth:CVPixelBufferGetWidth(pixelBuffer)
-                         height:CVPixelBufferGetHeight(pixelBuffer)
-                         stride:CVPixelBufferGetBytesPerRow(pixelBuffer)
-              pixelBufferFormat:CVPixelBufferGetPixelFormatType(pixelBuffer)
-                          error:error];
-
-  CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
-
-  if (!rgbPixelData) {
-    return nullptr;
-  }
-
-  std::unique_ptr<ImageFrame> imageFrame =
-      absl::make_unique<ImageFrame>(::mediapipe::ImageFormat::SRGB, width, height,
-                                    destinationStride, static_cast<uint8 *>(rgbPixelData),
-                                    /*deleter=*/free);
-
-  return imageFrame;
-}
-
 + (std::unique_ptr<ImageFrame>)imageFrameFromCVPixelBuffer:(CVPixelBufferRef)pixelBuffer
                                                      error:(NSError **)error {
   OSType pixelBufferFormat = CVPixelBufferGetPixelFormatType(pixelBuffer);
+  std::unique_ptr<ImageFrame> imageFrame = nullptr;
 
   switch (pixelBufferFormat) {
-    case kCVPixelFormatType_32RGBA:
+    // Core Video only supports pixel data of order BGRA for 32 bit RGBA images.
+    // Thus other formats like `kCVPixelFormatType_32BGRA` don't need to be accounted for.
     case kCVPixelFormatType_32BGRA: {
-      return [MPPCVPixelBufferUtils rgbImageFrameFromCVPixelBuffer:pixelBuffer error:error];
+      CVPixelBufferLockBaseAddress(pixelBuffer, 0);
+      imageFrame = [MPPPixelDataUtils
+          imageFrameFromPixelData:(uint8_t *)CVPixelBufferGetBaseAddress(pixelBuffer)
+                        withWidth:CVPixelBufferGetWidth(pixelBuffer)
+                           height:CVPixelBufferGetHeight(pixelBuffer)
+                           stride:CVPixelBufferGetBytesPerRow(pixelBuffer)
+                pixelBufferFormat:pixelBufferFormat
+                            error:error];
+      CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
+      break;
     }
     default: {
       [MPPCommonUtils createCustomError:error
                                withCode:MPPTasksErrorCodeInvalidArgumentError
-                            description:@"Unsupported pixel format for CVPixelBuffer. Supported "
-                                        @"pixel format types are kCVPixelFormatType_32BGRA and "
-                                        @"kCVPixelFormatType_32RGBA"];
+                            description:@"Unsupported pixel format for CVPixelBuffer. Expected "
+                                        @"kCVPixelFormatType_32BGRA"];
     }
   }
 
+  return imageFrame;
+}
+
++ (CVPixelBufferRef)cvPixelBufferFromImageFrame:(ImageFrame &)imageFrame error:(NSError **)error {
+  if (imageFrame.Format() != ImageFormat::SRGBA) {
+    [MPPCommonUtils createCustomError:error
+                             withCode:MPPTasksErrorCodeInternalError
+                          description:@"An error occured while creating a CVPixelBuffer from the "
+                                      @"output image of the vision task."];
+    return nullptr;
+  }
+
+  UInt8 *pixelData = [MPPPixelDataUtils pixelDataFromImageFrame:imageFrame
+                                                     shouldCopy:YES
+                                                          error:error];
+
+  if (!pixelData) {
+    return nullptr;
+  }
+
+  const uint8_t permute_map[4] = {2, 1, 0, 3};
+  vImage_Buffer sourceBuffer = CreateEmptyVImageBufferFromImageFrame(imageFrame, NO);
+  sourceBuffer.data = pixelData;
+
+  if (vImagePermuteChannels_ARGB8888(&sourceBuffer, &sourceBuffer, permute_map, kvImageNoFlags) ==
+      kvImageNoError) {
+    CVPixelBufferRef outputBuffer;
+
+    OSType pixelBufferFormatType = kCVPixelFormatType_32BGRA;
+
+    // Since data is copied, pass in a release callback that will be invoked when the pixel buffer
+    // is destroyed.
+    if (CVPixelBufferCreateWithBytes(kCFAllocatorDefault, imageFrame.Width(), imageFrame.Height(),
+                                     pixelBufferFormatType, pixelData, imageFrame.WidthStep(),
+                                     FreeRefConReleaseCallback, pixelData, nullptr,
+                                     &outputBuffer) == kCVReturnSuccess) {
+      return outputBuffer;
+    }
+  }
+
+  [MPPCommonUtils createCustomError:error
+                           withCode:MPPTasksErrorCodeInternalError
+                        description:@"An error occured while creating a CVPixelBuffer from the "
+                                    @"output image of the vision task."];
   return nullptr;
 }
 
@@ -190,20 +313,20 @@ using ::mediapipe::ImageFrame;
   NSInteger channelCount = 4;
   size_t bytesPerRow = channelCount * width;
 
-  NSInteger destinationChannelCount = 3;
-  size_t destinationBytesPerRow = destinationChannelCount * width;
-
-  UInt8 *pixelDataToReturn = NULL;
+  std::unique_ptr<ImageFrame> imageFrame = nullptr;
 
   CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
   // iOS infers bytesPerRow if it is set to 0.
   // See https://developer.apple.com/documentation/coregraphics/1455939-cgbitmapcontextcreate
   // But for segmentation test image, this was not the case.
   // Hence setting it to the value of channelCount*width.
-  // kCGImageAlphaNoneSkipLast specifies that Alpha will always be next to B.
+  // kCGImageAlphaPremultipliedLast specifies that Alpha will always be next to B and the R, G, B
+  // values will be pre multiplied with alpha. Images with alpha != 255 are stored with the R, G, B
+  // values premultiplied with alpha by iOS. Hence `kCGImageAlphaPremultipliedLast` ensures all
+  // kinds of images (alpha from 0 to 255) are correctly accounted for by iOS.
   // kCGBitmapByteOrder32Big specifies that R will be stored before B.
   // In combination they signify a pixelFormat of kCVPixelFormatType32RGBA.
-  CGBitmapInfo bitMapinfoFor32RGBA = kCGImageAlphaNoneSkipLast | kCGBitmapByteOrder32Big;
+  CGBitmapInfo bitMapinfoFor32RGBA = kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big;
   CGContextRef context = CGBitmapContextCreate(nil, width, height, bitsPerComponent, bytesPerRow,
                                                colorSpace, bitMapinfoFor32RGBA);
 
@@ -214,12 +337,12 @@ using ::mediapipe::ImageFrame;
     if (srcData) {
       // We have drawn the image as an RGBA image with 8 bitsPerComponent and hence can safely input
       // a pixel format of type kCVPixelFormatType_32RGBA for conversion by vImage.
-      pixelDataToReturn = [MPPPixelDataUtils rgbPixelDataFromPixelData:srcData
-                                                             withWidth:width
-                                                                height:height
-                                                                stride:bytesPerRow
-                                                     pixelBufferFormat:kCVPixelFormatType_32RGBA
-                                                                 error:error];
+      imageFrame = [MPPPixelDataUtils imageFrameFromPixelData:srcData
+                                                    withWidth:width
+                                                       height:height
+                                                       stride:bytesPerRow
+                                            pixelBufferFormat:kCVPixelFormatType_32RGBA
+                                                        error:error];
     }
 
     CGContextRelease(context);
@@ -227,16 +350,68 @@ using ::mediapipe::ImageFrame;
 
   CGColorSpaceRelease(colorSpace);
 
-  if (!pixelDataToReturn) {
+  return imageFrame;
+}
+
++ (CGImageRef)cgImageFromImageFrame:(std::shared_ptr<ImageFrame>)imageFrame
+                shouldCopyPixelData:(BOOL)shouldCopyPixelData
+                              error:(NSError **)error {
+  CGBitmapInfo bitmapInfo = kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault;
+
+  ImageFrame *internalImageFrame = imageFrame.get();
+
+  UInt8 *pixelData = [MPPPixelDataUtils pixelDataFromImageFrame:*internalImageFrame
+                                                     shouldCopy:shouldCopyPixelData
+                                                          error:error];
+
+  if (!pixelData) {
     return nullptr;
   }
 
-  std::unique_ptr<ImageFrame> imageFrame = absl::make_unique<ImageFrame>(
-      mediapipe::ImageFormat::SRGB, (int)width, (int)height, (int)destinationBytesPerRow,
-      static_cast<uint8 *>(pixelDataToReturn),
-      /*deleter=*/free);
+  switch (internalImageFrame->Format()) {
+    case ImageFormat::SRGBA: {
+      bitmapInfo = kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big;
+      break;
+    }
+    default:
+      [MPPCommonUtils createCustomError:error
+                               withCode:MPPTasksErrorCodeInternalError
+                            description:@"An error occured while creating a CGImage from the "
+                                        @"output image of the vision task."];
+      return nullptr;
+  }
 
-  return imageFrame;
+  CGDataProviderReleaseDataCallback callback = nullptr;
+
+  CGDataProviderRef provider = CGDataProviderCreateWithData(
+      pixelData, pixelData, internalImageFrame->WidthStep() * internalImageFrame->Height(),
+      callback);
+
+  CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+
+  CGImageRef cgImageRef = nullptr;
+
+  if (provider && colorSpace) {
+    size_t bitsPerComponent = 8;
+    size_t channelCount = 4;
+    cgImageRef =
+        CGImageCreate(internalImageFrame->Width(), internalImageFrame->Height(), bitsPerComponent,
+                      bitsPerComponent * channelCount, internalImageFrame->WidthStep(), colorSpace,
+                      bitmapInfo, provider, nullptr, YES, kCGRenderingIntentDefault);
+  }
+
+  // Can safely pass `NULL` to these functions according to iOS docs.
+  CGDataProviderRelease(provider);
+  CGColorSpaceRelease(colorSpace);
+
+  if (!cgImageRef) {
+    [MPPCommonUtils createCustomError:error
+                             withCode:MPPTasksErrorCodeInternalError
+                          description:@"An error occured while converting the output image of the "
+                                      @"vision task to a CGImage."];
+  }
+
+  return cgImageRef;
 }
 
 @end
@@ -276,6 +451,48 @@ using ::mediapipe::ImageFrame;
 @end
 
 @implementation MPPImage (Utils)
+
+- (nullable instancetype)initWithCppImage:(mediapipe::Image &)image
+           cloningPropertiesOfSourceImage:(MPPImage *)sourceImage
+                      shouldCopyPixelData:(BOOL)shouldCopyPixelData
+                                    error:(NSError **)error {
+  switch (sourceImage.imageSourceType) {
+    case MPPImageSourceTypeImage: {
+      CGImageRef cgImageRef = [MPPCGImageUtils cgImageFromImageFrame:image.GetImageFrameSharedPtr()
+                                                 shouldCopyPixelData:shouldCopyPixelData
+                                                               error:error];
+      UIImage *image = [UIImage imageWithCGImage:cgImageRef];
+      CGImageRelease(cgImageRef);
+
+      return [self initWithUIImage:image orientation:sourceImage.orientation error:nil];
+    }
+    case MPPImageSourceTypePixelBuffer: {
+      if (!shouldCopyPixelData) {
+        // TODO: Investigate possibility of permuting channels of `mediapipe::Image` returned by
+        // vision tasks in place to ensure that we can support creating `CVPixelBuffer`s without
+        // copying the pixel data.
+        [MPPCommonUtils
+            createCustomError:error
+                     withCode:MPPTasksErrorCodeInvalidArgumentError
+                  description:
+                      @"When the source type is pixel buffer, you cannot request uncopied data"];
+        return nil;
+      }
+
+      CVPixelBufferRef pixelBuffer =
+          [MPPCVPixelBufferUtils cvPixelBufferFromImageFrame:*(image.GetImageFrameSharedPtr())
+                                                       error:error];
+      MPPImage *image = [self initWithPixelBuffer:pixelBuffer
+                                      orientation:sourceImage.orientation
+                                            error:nil];
+      CVPixelBufferRelease(pixelBuffer);
+      return image;
+    }
+    default:
+      // TODO Implement CMSampleBuffer.
+      return nil;
+  }
+}
 
 - (std::unique_ptr<ImageFrame>)imageFrameWithError:(NSError **)error {
   switch (self.imageSourceType) {
