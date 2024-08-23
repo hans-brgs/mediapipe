@@ -102,6 +102,7 @@ py_library(
         ":model_spec",
         "//mediapipe/model_maker/python/core/data:classification_dataset",
         "//mediapipe/model_maker/python/core/tasks:classifier",
+        "//mediapipe/model_maker/python/core/utils:metrics",
         "//mediapipe/model_maker/python/core/utils:model_util",
         "//mediapipe/model_maker/python/core/utils:quantization",
         "//mediapipe/model_maker/python/vision/core:image_preprocessing",
@@ -112,7 +113,7 @@ py_library(
 
 py_library(
     name = "image_classifier_test_lib",
-    testonly = 1,
+    testonly = True,
     srcs = ["image_classifier_test.py"],
     data = ["//mediapipe/model_maker/python/vision/image_classifier/testdata"],
     deps = [
@@ -128,7 +129,10 @@ py_test(
     size = "large",
     srcs = ["image_classifier_test.py"],
     shard_count = 2,
-    tags = ["requires-net:external"],
+    tags = [
+        "notsan",  # TODO b/352507058 - TSAN run takes 18 minutes. Disabled for now.
+        "requires-net:external",
+    ],
     deps = [
         ":image_classifier_test_lib",
     ],

@@ -14,9 +14,13 @@
 
 package com.google.mediapipe.tasks.core;
 
-import com.google.mediapipe.tasks.core.OutputHandler.ValueListener;
+import android.content.Context;
+import com.google.mediapipe.tasks.core.OutputHandler.ProgressListener;
+import com.google.mediapipe.tasks.core.jni.proto.LlmOptionsProto.LlmModelSettings;
 import com.google.mediapipe.tasks.core.jni.proto.LlmOptionsProto.LlmSessionConfig;
 import com.google.mediapipe.tasks.core.jni.proto.LlmResponseContextProto.LlmResponseContext;
+import com.google.mediapipe.tasks.core.logging.TasksStatsDummyLogger;
+import com.google.mediapipe.tasks.core.logging.TasksStatsLogger;
 import com.google.protobuf.InvalidProtocolBufferException;
 import java.util.List;
 import java.util.Optional;
@@ -27,13 +31,21 @@ import java.util.Optional;
  * @hide
  */
 public final class LlmTaskRunner implements AutoCloseable {
+  private final long engineHandle;
   private final long sessionHandle;
-  private final Optional<ValueListener<List<String>>> resultListener;
+  private final Optional<ProgressListener<List<String>>> resultListener;
   private final long callbackHandle;
+  private final TasksStatsLogger statsLogger;
 
   public LlmTaskRunner(
-      LlmSessionConfig sessionConfig, Optional<ValueListener<List<String>>> resultListener) {
-    this.sessionHandle = nativeCreateSession(sessionConfig.toByteArray());
+      Context context,
+      String taskName,
+      LlmModelSettings modelSettings,
+      LlmSessionConfig sessionConfig,
+      Optional<ProgressListener<List<String>>> resultListener) {
+    statsLogger = TasksStatsDummyLogger.create(context, taskName, /* taskRunningModeStr= */ "");
+    this.engineHandle = nativeCreateEngine(modelSettings.toByteArray());
+    this.sessionHandle = nativeCreateSession(sessionConfig.toByteArray(), engineHandle);
 
     this.resultListener = resultListener;
     if (resultListener.isPresent()) {
@@ -41,12 +53,14 @@ public final class LlmTaskRunner implements AutoCloseable {
     } else {
       this.callbackHandle = 0;
     }
+    statsLogger.logSessionStart();
   }
 
   /** Invokes the LLM with the provided input and waits for the result. */
   public List<String> predictSync(String input) {
-    byte[] responseBytes = nativePredictSync(sessionHandle, input);
-    return parseResponse(responseBytes);
+    nativeAddQueryChunk(sessionHandle, input);
+    byte[] responseBytes = nativePredictSync(sessionHandle);
+    return parseResponse(responseBytes).getResponsesList();
   }
 
   /** Invokes the LLM with the provided input and calls the callback with the result. */
@@ -54,20 +68,26 @@ public final class LlmTaskRunner implements AutoCloseable {
     if (callbackHandle == 0) {
       throw new IllegalStateException("No result listener provided.");
     }
-    nativePredictAsync(sessionHandle, callbackHandle, input);
+    nativeAddQueryChunk(sessionHandle, input);
+    nativePredictAsync(sessionHandle, callbackHandle);
   }
 
-  private List<String> parseResponse(byte[] reponse) {
+  /** Invokes the native token cost calculator and returns the size of the string in tokens. */
+  public int sizeInTokens(String text) {
+    return nativeSizeInTokens(sessionHandle, text);
+  }
+
+  private LlmResponseContext parseResponse(byte[] response) {
     try {
-      LlmResponseContext result = LlmResponseContext.parseFrom(reponse);
-      return result.getResponsesList();
+      return LlmResponseContext.parseFrom(response);
     } catch (InvalidProtocolBufferException e) {
       throw new IllegalStateException("Failed to parse response", e);
     }
   }
 
   private void onAsyncResponse(byte[] responseBytes) {
-    resultListener.get().run(parseResponse(responseBytes));
+    LlmResponseContext respone = parseResponse(responseBytes);
+    resultListener.get().run(respone.getResponsesList(), respone.getDone());
   }
 
   @Override
@@ -76,18 +96,26 @@ public final class LlmTaskRunner implements AutoCloseable {
       nativeRemoveCallback(callbackHandle);
     }
     nativeDeleteSession(sessionHandle);
+    statsLogger.logSessionEnd();
   }
 
-  private static native long nativeCreateSession(byte[] sessionConfig);
+  private static native long nativeCreateEngine(byte[] modelSettings);
+
+  private static native void nativeDeleteEngine(long enginePointer);
+
+  private static native long nativeCreateSession(byte[] sessionConfig, long enginePointer);
 
   private static native void nativeDeleteSession(long sessionPointer);
 
-  private static native byte[] nativePredictSync(long sessionPointer, String input);
+  private static native void nativeAddQueryChunk(long sessionPointer, String input);
+
+  private static native byte[] nativePredictSync(long sessionPointer);
 
   private static native long nativeRegisterCallback(Object callback);
 
   private static native void nativeRemoveCallback(long callbackHandle);
 
-  private static native void nativePredictAsync(
-      long sessionPointer, long callbackContextHandle, String input);
+  private static native void nativePredictAsync(long sessionPointer, long callbackContextHandle);
+
+  private static native int nativeSizeInTokens(long sessionPointer, String input);
 }

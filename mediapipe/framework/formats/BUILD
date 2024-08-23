@@ -14,8 +14,8 @@
 #
 
 load("@bazel_skylib//lib:selects.bzl", "selects")
-load("//mediapipe/framework/port:build_config.bzl", "mediapipe_proto_library")
 load("//mediapipe/framework:mediapipe_register_type.bzl", "mediapipe_register_type")
+load("//mediapipe/framework/port:build_config.bzl", "mediapipe_proto_library")
 
 package(
     default_visibility = ["//visibility:public"],
@@ -299,6 +299,24 @@ cc_test(
 )
 
 cc_library(
+    name = "unique_fd",
+    hdrs = ["unique_fd.h"],
+    deps = [
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/log:absl_log",
+    ],
+)
+
+cc_test(
+    name = "unique_fd_test",
+    srcs = ["unique_fd_test.cc"],
+    deps = [
+        ":unique_fd",
+        "//mediapipe/framework/port:gtest_main",
+    ],
+)
+
+cc_library(
     name = "video_stream_header",
     hdrs = ["video_stream_header.h"],
     deps = [
@@ -487,7 +505,7 @@ config_setting(
         "MEDIAPIPE_NO_JNI": "1",
     },
     values = {"crosstool_top": "//external:android/crosstool"},
-    visibility = ["//visibility:private"],
+    visibility = ["//mediapipe/framework:__pkg__"],
 )
 
 cc_library(
@@ -511,16 +529,6 @@ cc_library(
         ],
         "//conditions:default": [],
     }),
-    defines = select({
-        # Excludes AHardwareBuffer features from vendor processes
-        "//mediapipe/framework:android_no_jni": ["MEDIAPIPE_NO_JNI"],
-        # unless they're linked against nativewindow.
-        ":android_link_native_window": [
-            "MEDIAPIPE_ANDROID_LINK_NATIVE_WINDOW",
-            "MEDIAPIPE_NO_JNI",
-        ],
-        "//conditions:default": [],
-    }),
     linkopts = select({
         "//mediapipe:apple": [
             "-framework CoreVideo",
@@ -533,10 +541,19 @@ cc_library(
     deps = [
         "//mediapipe/framework:memory_manager",
         "//mediapipe/framework:port",
+        "//mediapipe/framework/deps:no_destructor",
+        "//mediapipe/framework/port:aligned_malloc_and_free",
+        "//mediapipe/framework/port:ret_check",
+        "//mediapipe/framework/port:status",
+        "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
     ] + select({
         "//mediapipe/gpu:disable_gpu": [],
@@ -547,12 +564,16 @@ cc_library(
         "//mediapipe:android": [
             ":hardware_buffer",
             ":hardware_buffer_pool",
+            ":tensor_ahwb_usage",
+            ":unique_fd",
             "//mediapipe/gpu:gl_base",
             "//mediapipe/gpu:gl_context",
         ],
         ":android_link_native_window": [
             ":hardware_buffer",
             ":hardware_buffer_pool",
+            ":tensor_ahwb_usage",
+            ":unique_fd",
             "//mediapipe/gpu:gl_base",
             "//mediapipe/gpu:gl_context",
         ],
@@ -562,7 +583,10 @@ cc_library(
 cc_test(
     name = "tensor_test",
     srcs = ["tensor_test.cc"],
-    tags = ["not_run:arm"],
+    tags = [
+        "noasan",
+        "not_run:arm",  # TODO: Remove noasan tag when SwiftShader supports sanitizers
+    ],
     deps = [
         ":tensor",
         "//mediapipe/framework/port:gtest_main",
@@ -601,4 +625,25 @@ mediapipe_register_type(
         "::std::vector<::mediapipe::JointList>",
     ],
     deps = [":body_rig_cc_proto"],
+)
+
+cc_library(
+    name = "tensor_ahwb_usage",
+    srcs = ["tensor_ahwb_usage.cc"],
+    hdrs = ["tensor_ahwb_usage.h"],
+    deps = [
+        "//mediapipe/framework/port",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/log:absl_log",
+    ],
+)
+
+cc_test(
+    name = "tensor_ahwb_usage_test",
+    srcs = ["tensor_ahwb_usage_test.cc"],
+    deps = [
+        ":tensor_ahwb_usage",
+        "//mediapipe/framework/port:gtest_main",
+        "//mediapipe/framework/port:status",
+    ],
 )

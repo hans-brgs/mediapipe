@@ -16,6 +16,7 @@
 #define MEDIAPIPE_FRAMEWORK_FORMATS_TENSOR_H_
 
 #include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <initializer_list>
 #include <memory>
@@ -25,30 +26,25 @@
 #include <utility>
 #include <vector>
 
-#include "absl/container/flat_hash_map.h"
-#include "absl/log/absl_check.h"
+#include "absl/functional/any_invocable.h"
+#include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
 #include "mediapipe/framework/formats/tensor/internal.h"
 #include "mediapipe/framework/memory_manager.h"
+// Exports MEDIAPIPE_TENSOR_USE_AHWB macro.
 #include "mediapipe/framework/port.h"
-
-// Supported use cases for tensor_ahwb:
-// 1. Native code running in Android apps.
-// 2. Android vendor processes linked against nativewindow.
-#if !defined(MEDIAPIPE_NO_JNI) || defined(MEDIAPIPE_ANDROID_LINK_NATIVE_WINDOW)
-#if __ANDROID_API__ >= 26 || defined(__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__)
-#define MEDIAPIPE_TENSOR_USE_AHWB 1
-#endif  // __ANDROID_API__ >= 26 ||
-        // defined(__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__)
-#endif  // !defined(MEDIAPIPE_NO_JNI) ||
-        // defined(MEDIAPIPE_ANDROID_LINK_NATIVE_WINDOW)
 
 #ifdef MEDIAPIPE_TENSOR_USE_AHWB
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 
+#include <list>
+
+#include "absl/log/absl_check.h"
 #include "mediapipe/framework/formats/hardware_buffer.h"
 #include "mediapipe/framework/formats/hardware_buffer_pool.h"
+#include "mediapipe/framework/formats/tensor_ahwb_usage.h"
+#include "mediapipe/framework/formats/unique_fd.h"
 #endif  // MEDIAPIPE_TENSOR_USE_AHWB
 #if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_30
 #include "mediapipe/gpu/gl_base.h"
@@ -119,6 +115,7 @@ class Tensor {
     kUInt8,
     kInt8,
     kInt32,
+    kInt64,
     kChar,
     kBool
   };
@@ -149,11 +146,16 @@ class Tensor {
     int zero_point = 0;
   };
 
+  // memory_alignment is an optional argument to tell the API to allocate
+  // a buffer that is padded to multiples of memory_alignment bytes.
+  // memory_alignment must be power of 2, i.e. 2, 4, 8, 16, 64, etc.
+  // If memory_alignment is 0, then the buffer will not be padded.
+  // Note that memory_alignment is only applied to CPU storage (includes AHWBs).
   Tensor(ElementType element_type, const Shape& shape,
-         MemoryManager* memory_manager = nullptr);
+         MemoryManager* memory_manager = nullptr, int memory_alignment = 0);
   Tensor(ElementType element_type, const Shape& shape,
          const QuantizationParameters& quantization_parameters,
-         MemoryManager* memory_manager = nullptr);
+         MemoryManager* memory_manager = nullptr, int memory_alignment = 0);
 
   // Non-copyable.
   Tensor(const Tensor&) = delete;
@@ -170,7 +172,7 @@ class Tensor {
     auto buffer() const {
       // const and non-const return  type selection.
       return static_cast<typename std::tuple_element<
-          std::is_const<T>::value, std::tuple<P*, const P*> >::type>(buffer_);
+          std::is_const<T>::value, std::tuple<P*, const P*>>::type>(buffer_);
     }
     CpuView(CpuView&& src) : View(std::move(src.lock_)) {
       buffer_ = std::exchange(src.buffer_, nullptr);
@@ -183,12 +185,12 @@ class Tensor {
    protected:
     friend class Tensor;
     CpuView(T* buffer, std::unique_ptr<absl::MutexLock>&& lock,
-            std::function<void()> release_callback = nullptr)
+            absl::AnyInvocable<void()> release_callback = nullptr)
         : View(std::move(lock)),
           buffer_(buffer),
-          release_callback_(release_callback) {}
+          release_callback_(std::move(release_callback)) {}
     T* buffer_;
-    std::function<void()> release_callback_;
+    absl::AnyInvocable<void()> release_callback_;
   };
   using CpuReadView = CpuView<const void>;
   CpuReadView GetCpuReadView() const;
@@ -199,6 +201,7 @@ class Tensor {
 
 #ifdef MEDIAPIPE_TENSOR_USE_AHWB
   using FinishingFunc = std::function<bool(bool)>;
+
   class AHardwareBufferView : public View {
    public:
     AHardwareBuffer* handle() const {
@@ -207,53 +210,63 @@ class Tensor {
     AHardwareBufferView(AHardwareBufferView&& src)
         : View(std::move(src.lock_)) {
       hardware_buffer_ = std::move(src.hardware_buffer_);
-      file_descriptor_ = src.file_descriptor_;
+      file_descriptor_ = std::exchange(src.file_descriptor_, nullptr);
       fence_fd_ = std::exchange(src.fence_fd_, nullptr);
-      ahwb_written_ = std::exchange(src.ahwb_written_, nullptr);
-      release_callback_ = std::exchange(src.release_callback_, nullptr);
+      ahwb_usage_ = std::exchange(src.ahwb_usage_, nullptr);
+      is_write_view_ = src.is_write_view_;
     }
-    int file_descriptor() const { return file_descriptor_; }
+
+    int file_descriptor() const { return file_descriptor_->Get(); }
+
+    // TODO: verify if multiple functions can be specified.
     void SetReadingFinishedFunc(FinishingFunc&& func) {
-      ABSL_CHECK(ahwb_written_)
+      ABSL_CHECK(!is_write_view_)
           << "AHWB write view can't accept 'reading finished callback'";
-      *ahwb_written_ = std::move(func);
+      ABSL_CHECK(ahwb_usage_->is_complete_fn == nullptr)
+          << "AHWB reading finished callback is already set.";
+      ahwb_usage_->is_complete_fn = std::move(func);
     }
+
+    // TODO: verify if multiple functions can be specified.
     void SetWritingFinishedFD(int fd, FinishingFunc func = nullptr) {
-      ABSL_CHECK(fence_fd_)
+      ABSL_CHECK(is_write_view_)
           << "AHWB read view can't accept 'writing finished file descriptor'";
-      *fence_fd_ = fd;
-      *ahwb_written_ = std::move(func);
+      ABSL_CHECK(ahwb_usage_->is_complete_fn == nullptr)
+          << "AHWB write finished callback is already set.";
+      *fence_fd_ = UniqueFd(fd);
+      ahwb_usage_->is_complete_fn = std::move(func);
     }
-    // The function is called when the tensor is released.
-    void SetReleaseCallback(std::function<void()> callback) {
-      *release_callback_ = std::move(callback);
+
+    // Passed `callback` is invoked when the tensor is being released.
+    // TODO: rename to Add* or set a single callback only.
+    void SetReleaseCallback(absl::AnyInvocable<void()> callback) {
+      ahwb_usage_->release_callbacks.push_back(std::move(callback));
     }
 
    protected:
     friend class Tensor;
-    AHardwareBufferView(HardwareBuffer* hardware_buffer, int file_descriptor,
-                        int* fence_fd, FinishingFunc* ahwb_written,
-                        std::function<void()>* release_callback,
-                        std::unique_ptr<absl::MutexLock>&& lock)
+    AHardwareBufferView(HardwareBuffer* hardware_buffer,
+                        UniqueFd* file_descriptor, UniqueFd* fence_fd,
+                        TensorAhwbUsage* ahwb_usage,
+                        std::unique_ptr<absl::MutexLock>&& lock,
+                        bool is_write_view)
         : View(std::move(lock)),
           hardware_buffer_(hardware_buffer),
           file_descriptor_(file_descriptor),
           fence_fd_(fence_fd),
-          ahwb_written_(ahwb_written),
-          release_callback_(release_callback) {}
-    HardwareBuffer* hardware_buffer_;
-    int file_descriptor_;
+          ahwb_usage_(ahwb_usage),
+          is_write_view_(is_write_view) {}
+
+    HardwareBuffer* hardware_buffer_ = nullptr;
+    UniqueFd* file_descriptor_ = nullptr;
     // The view sets some Tensor's fields. The view is released prior to tensor.
-    int* fence_fd_;
-    FinishingFunc* ahwb_written_;
-    std::function<void()>* release_callback_;
+    UniqueFd* fence_fd_ = nullptr;
+    TensorAhwbUsage* ahwb_usage_ = nullptr;
+    bool is_write_view_ = false;
   };
+
   AHardwareBufferView GetAHardwareBufferReadView() const;
-  // size_alignment is an optional argument to tell the API to allocate
-  // a buffer that is padded to multiples of size_alignment bytes.
-  // size_alignment must be power of 2, i.e. 2, 4, 8, 16, 64, etc.
-  // If size_alignment is 0, then the buffer will not be padded.
-  AHardwareBufferView GetAHardwareBufferWriteView(int size_alignment = 0) const;
+  AHardwareBufferView GetAHardwareBufferWriteView() const;
 #endif  // MEDIAPIPE_TENSOR_USE_AHWB
 
 #if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_30
@@ -343,6 +356,8 @@ class Tensor {
         return 1;
       case ElementType::kInt32:
         return sizeof(int32_t);
+      case ElementType::kInt64:
+        return sizeof(int64_t);
       case ElementType::kChar:
         return sizeof(char);
       case ElementType::kBool:
@@ -365,15 +380,18 @@ class Tensor {
   bool ready_as_opengl_texture_2d() const {
     return valid_ & kValidOpenGlTexture2d;
   }
+  bool ready_as_ahwb() const { return use_ahwb_; }
 
  private:
   friend class MtlBufferView;
   void Move(Tensor*);
   void Invalidate();
+  absl::Status ReadBackGpuToCpu() const;
 
   ElementType element_type_;
   Shape shape_;
   QuantizationParameters quantization_parameters_;
+  int memory_alignment_ = 0;
 
   // The flags describe the current source of truth resource type.
   enum {
@@ -391,41 +409,47 @@ class Tensor {
   mutable absl::Mutex view_mutex_;
 
   mutable void* cpu_buffer_ = nullptr;
-  void AllocateCpuBuffer() const;
+  absl::Status AllocateCpuBuffer() const;
+  void FreeCpuBuffer() const;
   // Forward declaration of the MtlResources provides compile-time verification
   // of ODR if this header includes any actual code that uses MtlResources.
   mutable std::unique_ptr<MtlResources> mtl_resources_;
 
 #ifdef MEDIAPIPE_TENSOR_USE_AHWB
   mutable std::shared_ptr<HardwareBuffer> ahwb_;
+
   // Allocates and pools HardwareBuffer instances. Holding the shared_ptr to the
   // pool ensures it outlives the internal ahwb_.
   std::shared_ptr<HardwareBufferPool> hardware_buffer_pool_;
+
   // Signals when GPU finished writing into SSBO so AHWB can be used then. Or
   // signals when writing into AHWB has been finished so GPU can read from SSBO.
   // Sync and FD are bound together.
   mutable EGLSyncKHR fence_sync_ = EGL_NO_SYNC_KHR;
+
   // This FD signals when the writing into the SSBO has been finished.
-  mutable int ssbo_written_ = -1;
+  mutable UniqueFd ssbo_written_;
+
   // An externally set FD that is wrapped with the EGL sync then to synchronize
   // AHWB -> OpenGL SSBO.
-  mutable int fence_fd_ = -1;
+  mutable UniqueFd fence_fd_;
+
   // Reading from SSBO has been finished so SSBO can be released.
   mutable GLsync ssbo_read_ = 0;
-  // An externally set function that signals when it is safe to release AHWB.
-  // If the input parameter is 'true' then wait for the writing to be finished.
-  mutable FinishingFunc ahwb_written_;
-  mutable std::function<void()> release_callback_;
-  bool AllocateAHardwareBuffer(int size_alignment = 0) const;
+
+  // Keeps track of current AHWB usages (e.g. multiple reads - two inference
+  // calculators use the same input tensor and import buffer by FD which results
+  // in two buffer handles that must be released.)
+  mutable std::list<TensorAhwbUsage> ahwb_usages_;
+
+  absl::Status AllocateAHardwareBuffer() const;
+
   void CreateEglSyncAndFd() const;
 #endif  // MEDIAPIPE_TENSOR_USE_AHWB
+
   // Use Ahwb for other views: OpenGL / CPU buffer.
   mutable bool use_ahwb_ = false;
   mutable uint64_t ahwb_tracking_key_ = 0;
-  // TODO: Tracks all unique tensors. Can grow to a large number. LRU
-  // (Least Recently Used) can be more predicted.
-  // The value contains the size alignment parameter.
-  static inline absl::flat_hash_map<uint64_t, int> ahwb_usage_track_;
   // Expects the target SSBO to be already bound.
   bool AllocateAhwbMapToSsbo() const;
   bool InsertAhwbToSsboFence() const;
